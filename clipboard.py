@@ -1,239 +1,276 @@
 #!/usr/bin/env python3
+
 import gi
 gi.require_version('Gtk', '3.0')
-from gi.repository import Gtk, Gdk, GLib
-import os
-import json
+gi.require_version('Pango', '1.0')
+from gi.repository import Gtk, Gdk, GLib, Pango
+
+import pyperclip
+import threading
+import time
+from collections import deque
 from pynput import keyboard
+from pynput.keyboard import Key, KeyCode, Controller as KeyboardController
+# import os # No longer needed as script_name print is removed
 
-class ClipboardManager:
-    def __init__(self):
-        # Create a Gtk application
-        self.app = Gtk.Application(application_id="com.user.clipboardmanager")
-        self.app.connect("activate", self.on_activate)
-        
-        # Initialize clipboard
-        self.clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
-        
-        # Set up clipboard owner-change signal for efficient monitoring
-        # This is much more efficient than polling
-        self.clipboard.connect('owner-change', self.on_clipboard_change)
-        
-        # Clipboard history (max 25 items)
-        self.history = []
-        self.max_items = 25
-        
-        # Load history from file if it exists
-        self.history_file = os.path.expanduser("~/.clipboard_history.json")
-        self.load_history()
-        
-        # Current clipboard content
-        self.current_text = self.clipboard.wait_for_text()
+# --- Configuration ---
+HISTORY_SIZE = 25
+HOTKEY_COMBINATION = {Key.alt_l, KeyCode.from_char('v')}
 
-    def load_history(self):
-        """Load clipboard history from file"""
-        if os.path.exists(self.history_file):
-            try:
-                with open(self.history_file, 'r') as f:
-                    self.history = json.load(f)
-                    # Keep only max_items
-                    self.history = self.history[:self.max_items]
-            except Exception as e:
-                print(f"Error loading history: {e}")
-                self.history = []
+# --- Global State ---
+clipboard_history = deque(maxlen=HISTORY_SIZE)
+last_added_text = None # Track what we last *added* to history
+clipboard_window = None # Holds the single, persistent window instance
+window_created = False # Flag to know if window exists
+monitoring_active = True # To prevent self-pasting feedback loop
+keyboard_controller = KeyboardController()
+# script_name = os.path.basename(__file__) # Removed
+gtk_clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD) # Use GTK clipboard for signals
+current_keys = set() # Moved global definition here for clarity
 
-    def save_history(self):
-        """Save clipboard history to file"""
-        try:
-            with open(self.history_file, 'w') as f:
-                json.dump(self.history, f)
-        except Exception as e:
-            print(f"Error saving history: {e}")
+# --- Clipboard Monitoring (Event-Driven) ---
+def on_clipboard_owner_change(clipboard, event):
+    """Callback when clipboard owner changes."""
+    clipboard.request_text(on_clipboard_text_received, None)
 
-    def on_clipboard_change(self, clipboard, event):
-        """Handle clipboard content changes via signal"""
-        # Use a small timeout to allow clipboard content to be fully available
-        GLib.timeout_add(100, self.process_clipboard_change)
-        
-    def process_clipboard_change(self):
-        """Process the changed clipboard content"""
-        text = self.clipboard.wait_for_text()
-        if text and text != self.current_text and text.strip():
-            self.current_text = text
-            
-            # Remove this item if it already exists in history
-            if text in self.history:
-                self.history.remove(text)
-                
-            # Add new text to the beginning of history
-            self.history.insert(0, text)
-            
-            # Trim history to max length
-            if len(self.history) > self.max_items:
-                self.history = self.history[:self.max_items]
-                
-            # Save history to file
-            self.save_history()
-            
-            # Update listbox if window is open
-            if hasattr(self, 'listbox') and self.window.is_visible():
-                self.update_listbox()
-        
-        # Don't repeat this timeout
+def on_clipboard_text_received(clipboard, text, user_data):
+    """Process text received from clipboard."""
+    GLib.idle_add(process_new_clipboard_text, text)
+    return False
+
+def process_new_clipboard_text(text):
+    """Adds new, valid text to history deque."""
+    global last_added_text, monitoring_active
+
+    if not monitoring_active:
         return False
 
-    def on_activate(self, app):
-        """Set up the main application window"""
-        # Create window
-        self.window = Gtk.ApplicationWindow(application=app)
-        self.window.set_title("Clipboard History")
-        self.window.set_default_size(400, 500)
-        self.window.connect("delete-event", self.on_window_close)
-        
-        # Create a scrolled window
-        scrolled_window = Gtk.ScrolledWindow()
-        scrolled_window.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        
-        # Create listbox for clipboard items
-        self.listbox = Gtk.ListBox()
-        self.listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
-        self.listbox.connect("row-activated", self.on_item_clicked)
-        
-        # Update listbox with current history
-        self.update_listbox()
-        
-        # Add listbox to scrolled window
-        scrolled_window.add(self.listbox)
-        
-        # Add scrolled window to main window
-        self.window.add(scrolled_window)
-        
-        # Set up global hotkey using pynput
-        self.listener = keyboard.GlobalHotKeys({
-            '<alt>+v': self.toggle_visibility
-        })
-        self.listener.start()
-        
-        # Show all widgets then hide window
-        self.window.show_all()
-        self.window.hide()
+    if text and isinstance(text, str) and len(text.strip()) > 0:
+        if text != last_added_text:
+            # print(f"Adding to history: {text[:30]}...") # Removed debug print
+            if text in clipboard_history:
+                temp_list = list(clipboard_history)
+                temp_list.remove(text)
+                clipboard_history.clear()
+                clipboard_history.extendleft(reversed(temp_list))
 
-    def update_listbox(self):
-        """Update the listbox with current clipboard history"""
-        # Remove all existing rows
-        for child in self.listbox.get_children():
-            self.listbox.remove(child)
-        
-        # Add empty state message if no history
-        if not self.history:
-            label = Gtk.Label(label="No clipboard history yet")
-            label.set_margin_top(20)
-            label.set_margin_bottom(20)
-            self.listbox.add(label)
-            self.listbox.show_all()
-            return
-            
-        # Add each history item
-        for item in self.history:
-            # Truncate long text for display
-            display_text = item[:100] + "..." if len(item) > 100 else item
-            display_text = display_text.replace("\n", " ")
-            
-            # Create a box for the item (better styling)
-            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-            box.set_margin_start(10)
-            box.set_margin_end(10)
-            box.set_margin_top(8)
-            box.set_margin_bottom(8)
-            
-            # Create a label with the text
-            label = Gtk.Label(label=display_text)
+            clipboard_history.appendleft(text)
+            last_added_text = text
+
+            if clipboard_window and clipboard_window.is_visible():
+                 update_listbox_content()
+
+    return False # Tell GLib.idle_add not to repeat
+
+# --- GUI Window ---
+def create_clipboard_window():
+    """Creates the persistent clipboard window (but doesn't show it)."""
+    global clipboard_window, window_created
+
+    if window_created:
+        return
+
+    # print("Creating persistent clipboard window...") # Removed debug print
+    window = Gtk.Window(title="Clipboard History")
+    window.set_position(Gtk.WindowPosition.CENTER)
+    window.set_default_size(400, 500)
+    window.set_keep_above(True)
+    window.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+
+    window.connect("delete-event", on_window_hide_request)
+    window.connect("key-press-event", on_key_press_hide)
+    window.connect("destroy", on_window_destroyed_cleanup)
+
+    vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    window.add(vbox)
+
+    listbox = Gtk.ListBox()
+    listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
+    listbox.connect("row-activated", on_item_activated)
+    window.listbox = listbox # Store reference
+
+    scrolled_window = Gtk.ScrolledWindow()
+    scrolled_window.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+    scrolled_window.add(listbox)
+    vbox.pack_start(scrolled_window, True, True, 0)
+
+    clear_button = Gtk.Button(label="Clear History")
+    clear_button.connect("clicked", on_clear_clicked)
+    vbox.pack_start(clear_button, False, False, 0)
+
+    clipboard_window = window
+    window_created = True
+
+def update_listbox_content():
+    """Refreshes the items shown in the ListBox."""
+    if not clipboard_window or not hasattr(clipboard_window, 'listbox'):
+        return
+
+    listbox = clipboard_window.listbox
+    for child in listbox.get_children():
+        child.destroy()
+
+    if not clipboard_history:
+        label = Gtk.Label(label="Clipboard history is empty.")
+        listbox.add(label)
+    else:
+        for item_text in clipboard_history:
+            label = Gtk.Label()
+            label.set_text(item_text)
             label.set_halign(Gtk.Align.START)
             label.set_line_wrap(True)
-            label.set_max_width_chars(40)
-            
-            # Add label to box
-            box.add(label)
-            
-            # Add a separator
-            if item != self.history[-1]:  # Don't add separator after last item
-                separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
-                separator.set_margin_top(8)
-                box.add(separator)
-            
-            # Add box to listbox
-            self.listbox.add(box)
-        
-        self.listbox.show_all()
+            label.set_max_width_chars(60)
+            label.set_ellipsize(Pango.EllipsizeMode.END)
+            label.set_margin_top(3)
+            label.set_margin_bottom(3)
+            label.set_margin_start(5)
+            label.set_margin_end(5)
+            row = Gtk.ListBoxRow()
+            row.add(label)
+            row.set_tooltip_text(item_text)
+            row.clipboard_text = item_text
+            listbox.add(row)
 
-    def on_item_clicked(self, listbox, row):
-        """Handle click on a clipboard item"""
-        index = row.get_index()
-        
-        # Empty state row
-        if not self.history:
-            self.window.hide()
-            return
-            
-        if 0 <= index < len(self.history):
-            # Get the text from history
-            text = self.history[index]
-            
-            # Set clipboard text
-            self.clipboard.set_text(text, -1)
-            
-            # Hide our window
-            self.window.hide()
-            
-            # Sleep a bit and then paste
-            GLib.timeout_add(300, self.perform_paste)
-            
-    def perform_paste(self):
-        """Perform paste operation"""
-        try:
-            # Wait a bit for focus to return to previous window
-            os.system("sleep 0.3")
-            
-            # Try pynput first as it seems more reliable
-            from pynput.keyboard import Controller, Key
-            keyboard = Controller()
-            keyboard.press(Key.ctrl)
-            keyboard.press('v')
-            keyboard.release('v')
-            keyboard.release(Key.ctrl)
-            
-            # Also try xdotool as a backup
-            os.system("xdotool key --clearmodifiers ctrl+v")
-        except Exception as e:
-            print(f"Error pasting: {e}")
-        
-        return False
-
-    def toggle_visibility(self):
-        """Toggle the visibility of the window"""
-        # Need to use GLib.idle_add to safely update UI from a different thread
-        def toggle():
-            if self.window.is_visible():
-                self.window.hide()
-            else:
-                # Update listbox before showing
-                self.update_listbox()
-                self.window.present()
-            return False
-            
-        GLib.idle_add(toggle)
-
-    def on_window_close(self, window, event):
-        """Handle window close event"""
-        window.hide()
-        return True  # Prevent window from closing
-
-    def run(self):
-        """Run the application"""
-        self.app.run(None)
+    listbox.show_all()
 
 
+def show_clipboard_window():
+    """Shows the persistent clipboard window."""
+    global clipboard_window
+    if not window_created:
+        create_clipboard_window()
+
+    if clipboard_window:
+        if clipboard_window.is_visible():
+            # print("Window already visible, presenting.") # Removed debug print
+            clipboard_window.present()
+        else:
+            # print("Showing clipboard window...") # Removed debug print
+            update_listbox_content()
+            clipboard_window.show_all()
+            clipboard_window.present()
+            # GLib.idle_add(clipboard_window.grab_focus) # Optional focus grab
+
+def hide_clipboard_window():
+    """Hides the persistent clipboard window."""
+    if clipboard_window and clipboard_window.is_visible():
+        # print("Hiding clipboard window.") # Removed debug print
+        clipboard_window.hide()
+
+# --- Event Handlers ---
+def on_window_hide_request(widget, event):
+    """Handles clicking the window's close button."""
+    hide_clipboard_window()
+    return True # Prevent default destroy action
+
+def on_window_destroyed_cleanup(widget):
+    """Cleanup if window is somehow destroyed externally."""
+    global clipboard_window, window_created
+    # print("Clipboard window was destroyed.") # Removed debug print
+    clipboard_window = None
+    window_created = False
+
+def on_key_press_hide(widget, event):
+    """Handles key presses on the clipboard window (e.g., Escape)."""
+    if event.keyval == Gdk.KEY_Escape:
+        # print("Escape key pressed, hiding window.") # Removed debug print
+        hide_clipboard_window()
+        return True
+    return False
+
+def on_item_activated(listbox, row):
+    """Handles selecting an item from the list."""
+    global monitoring_active, last_added_text
+    selected_text = row.clipboard_text
+    # print(f"Item selected: {selected_text[:30]}...") # Removed debug print
+
+    monitoring_active = False # Prevent self-copy
+    try:
+        pyperclip.copy(selected_text)
+        last_added_text = selected_text # Update immediately
+    except Exception as e:
+        print(f"Error setting clipboard: {e}") # Keep error print
+        monitoring_active = True
+        hide_clipboard_window()
+        return
+
+    hide_clipboard_window()
+
+    GLib.timeout_add(100, paste_and_reenable_monitoring)
+
+def on_clear_clicked(button):
+    """Handles the clear history button."""
+    global clipboard_history, last_added_text
+    # print("Clearing clipboard history.") # Removed debug print
+    clipboard_history.clear()
+    last_added_text = None
+    # print("History cleared.") # Removed debug print
+    update_listbox_content()
+    hide_clipboard_window()
+
+def paste_and_reenable_monitoring():
+    """Simulates paste and re-enables monitoring."""
+    global monitoring_active
+    # print("Simulating Ctrl+V...") # Removed debug print
+    try:
+        time.sleep(0.05) # Keep small delay
+        keyboard_controller.press(Key.ctrl_l)
+        keyboard_controller.press('v')
+        keyboard_controller.release('v')
+        keyboard_controller.release(Key.ctrl_l)
+    except Exception as e:
+        print(f"Error simulating paste: {e}") # Keep error print
+    finally:
+        # print("Re-enabling clipboard monitoring.") # Removed debug print
+        monitoring_active = True
+    return False # Stop GLib timer
+
+# --- Hotkey Listener ---
+def on_press(key):
+    """Hotkey press handler."""
+    global current_keys # Make sure using global
+    if key in HOTKEY_COMBINATION:
+        current_keys.add(key)
+        if all(k in current_keys for k in HOTKEY_COMBINATION):
+            # print("Hotkey detected!") # Removed debug print
+            GLib.idle_add(show_clipboard_window)
+
+def on_release(key):
+    """Hotkey release handler."""
+    global current_keys # Make sure using global
+    try:
+        current_keys.remove(key)
+    except KeyError:
+        pass
+
+def listen_for_hotkey():
+    """Starts the pynput hotkey listener."""
+    global current_keys
+    current_keys = set() # Reset keys on listener start
+    # print(f"Hotkey listener started...") # Removed debug print
+    try:
+        with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
+            listener.join()
+    except Exception as e:
+        # Keep crucial error message
+        print(f"ERROR starting pynput listener: {e}")
+        # Attempt to gracefully stop the GTK main loop if listener fails
+        GLib.idle_add(Gtk.main_quit)
+
+
+# --- Main Execution ---
 if __name__ == "__main__":
-    # Run the clipboard manager
-    manager = ClipboardManager()
-    manager.run()
+
+    hotkey_thread = threading.Thread(target=listen_for_hotkey, daemon=True)
+    hotkey_thread.start()
+
+    gtk_clipboard.connect('owner-change', on_clipboard_owner_change)
+
+    # Removed startup status prints
+
+    try:
+        Gtk.main()
+    except KeyboardInterrupt:
+        print("\nExiting gracefully.") # Keep exit message
+
+    # print(f"{script_name} exited.") # Removed debug print

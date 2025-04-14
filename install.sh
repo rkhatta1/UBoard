@@ -23,7 +23,7 @@ print_color "blue" "This script will install the clipboard manager and its depen
 # Install dependencies
 print_color "yellow" "Installing required dependencies..."
 sudo apt-get update
-sudo apt-get install -y python3 python3-gi python3-pynput gir1.2-gtk-3.0 xdotool
+sudo apt-get install -y python3 python3-gi python3-pynput gir1.2-gtk-3.0 xdotool python3-cairo python3-pyperclip
 
 # Create user bin directory if it doesn't exist
 if [ ! -d "$HOME/bin" ]; then
